@@ -1,1116 +1,420 @@
-
-import io
 import re
-from pathlib import Path
-from datetime import datetime
 from collections import Counter
 
 import pandas as pd
 import streamlit as st
 
-from app.resume_parser import (
-    extract_pdf_text,
-    extract_candidate_info,
-    load_skills,
-)
-from app.matcher import rank_resumes
-
-
-# ==================================================
-# PAGE CONFIGURATION
-# ==================================================
-
-st.set_page_config(
-    page_title="Intelligent Resume Screening | Shaiq Hassan",
-    page_icon="📄",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-SAMPLE_JOB_DESCRIPTION = """
-Job Title: Python and Machine Learning Developer
-
-We are looking for a Python Developer with knowledge of
-Machine Learning, Natural Language Processing (NLP), and data analysis.
-
-Required skills:
-- Python programming
-- Machine Learning
-- Natural Language Processing
-- Pandas and NumPy
-- Scikit-learn
-- Data cleaning and preprocessing
-- Model development and evaluation
-- Problem-solving and analytical skills
-
-Responsibilities:
-- Develop and test machine learning models.
-- Process and analyze datasets using Python.
-- Build NLP-based applications.
-- Evaluate model performance and document results.
-
-Preferred qualification:
-Bachelor's degree in Computer Science, Artificial Intelligence,
-or a related field.
-"""
-
-
-# ==================================================
-# SESSION STATE
-# ==================================================
-
-if "job_description" not in st.session_state:
-    st.session_state["job_description"] = ""
-
-if "resume_results" not in st.session_state:
-    st.session_state["resume_results"] = None
-
-if "job_skills" not in st.session_state:
-    st.session_state["job_skills"] = []
-
-if "quality_summary" not in st.session_state:
-    st.session_state["quality_summary"] = {}
-
-if "unreadable_files" not in st.session_state:
-    st.session_state["unreadable_files"] = []
-
-
-# ==================================================
-# HELPER FUNCTIONS
-# ==================================================
-
-def find_skills(text, available_skills):
-    """Find known skills mentioned in text."""
-
-    found = []
-
-    for skill in available_skills:
-        pattern = r"(?<!\w)" + re.escape(skill) + r"(?!\w)"
-
-        if re.search(pattern, text, flags=re.IGNORECASE):
-            found.append(skill)
-
-    return found
-
-
-def get_match_strength(score):
-    """Describe textual similarity, not hiring suitability."""
-
-    if score >= 70:
-        return "Higher similarity", "🟢"
-
-    if score >= 45:
-        return "Moderate similarity", "🟡"
-
-    return "Lower similarity", "⚪"
-
-
-def build_report_csv(results_df, job_description, job_skills):
-    """
-    Build a CSV containing report metadata, score statistics,
-    candidate results, and a detected-skill frequency summary.
-    """
-
-    output = io.StringIO()
-
-    if results_df.empty:
-        summary_rows = [
-            ["Metric", "Value"],
-            ["Report generated", datetime.now().isoformat(timespec="seconds")],
-            ["Candidates analyzed", 0],
-            ["Average similarity (%)", ""],
-            ["Highest similarity (%)", ""],
-            ["Lowest similarity (%)", ""],
-            ["Skills identified in job description", ", ".join(job_skills)],
-        ]
-
-        pd.DataFrame(
-            summary_rows[1:],
-            columns=summary_rows[0],
-        ).to_csv(output, index=False)
-
-        return output.getvalue().encode("utf-8-sig")
-
-    scores = results_df["similarity_percent"].astype(float)
-
-    summary_rows = [
-        ["Report generated", datetime.now().isoformat(timespec="seconds")],
-        ["Candidates analyzed", len(results_df)],
-        ["Average similarity (%)", round(scores.mean(), 2)],
-        ["Highest similarity (%)", round(scores.max(), 2)],
-        ["Lowest similarity (%)", round(scores.min(), 2)],
-        ["Job-description skills identified", len(job_skills)],
-        ["Job-description skill list", ", ".join(job_skills)],
-        [
-            "Candidates with quality warnings",
-            int(results_df["quality_warning_count"].gt(0).sum()),
-        ],
-    ]
-
-    output.write("REPORT SUMMARY\n")
-    pd.DataFrame(
-        summary_rows,
-        columns=["Metric", "Value"],
-    ).to_csv(output, index=False)
-
-    output.write("\nCANDIDATE RESULTS\n")
-
-    candidate_columns = [
-        "rank",
-        "candidate_name",
-        "similarity_score",
-        "similarity_percent",
-        "email",
-        "phone",
-        "skills",
-        "matched_skills",
-        "not_detected_skills",
-        "quality_warnings",
-        "filename",
-    ]
-
-    candidate_export = results_df[candidate_columns].copy()
-
-    candidate_export["matched_skills"] = candidate_export[
-        "matched_skills"
-    ].apply(lambda items: ", ".join(items))
-
-    candidate_export["not_detected_skills"] = candidate_export[
-        "not_detected_skills"
-    ].apply(lambda items: ", ".join(items))
-
-    candidate_export["quality_warnings"] = candidate_export[
-        "quality_warnings"
-    ].apply(lambda items: "; ".join(items))
-
-    candidate_export.to_csv(output, index=False)
-
-    output.write("\nDETECTED SKILL FREQUENCY\n")
-
-    frequency = Counter()
-
-    for skills in results_df["detected_skill_list"]:
-        for skill in skills:
-            frequency[skill] += 1
-
-    frequency_rows = [
-        {
-            "Skill": skill,
-            "Candidates with skill detected": count,
-            "Percentage of candidates (%)": round(
-                count / len(results_df) * 100, 2
-            ),
-        }
-        for skill, count in frequency.most_common()
-    ]
-
-    if frequency_rows:
-        pd.DataFrame(frequency_rows).to_csv(output, index=False)
-    else:
-        pd.DataFrame(
-            columns=[
-                "Skill",
-                "Candidates with skill detected",
-                "Percentage of candidates (%)",
-            ]
-        ).to_csv(output, index=False)
-
-    return output.getvalue().encode("utf-8-sig")
-
-
-def build_candidate_csv(results_df):
-    """Export only the candidate rows passed to this function."""
-
-    export_df = results_df.drop(
-        columns=[
-            "resume_text",
-            "detected_skill_list",
-            "matched_skills",
-            "not_detected_skills",
-        ],
-        errors="ignore",
-    ).copy()
-
-    for column in ["quality_warnings"]:
-        if column in export_df.columns:
-            export_df[column] = export_df[column].apply(
-                lambda items: "; ".join(items)
-                if isinstance(items, list)
-                else str(items)
-            )
-
-    return export_df.to_csv(index=False).encode("utf-8-sig")
-
-
-# ==================================================
-# CUSTOM STYLING
-# ==================================================
-
-st.markdown(
-    """
-    <style>
-    @import url(
-      'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap'
-    );
-
-    .stApp {
-        font-family: 'Inter', sans-serif;
-    }
-
-    .block-container {
-        padding-top: 2rem;
-        padding-bottom: 3rem;
-        max-width: 1450px;
-    }
-
-    [data-testid="stSidebar"] {
-        border-right: 1px solid rgba(148, 163, 184, 0.18);
-    }
-
-    .hero {
-        padding: 30px;
-        border-radius: 22px;
-        margin-bottom: 25px;
-        background: linear-gradient(
-            120deg, #111827 0%, #172554 60%, #164e63 100%
-        );
-        border: 1px solid rgba(147, 197, 253, 0.25);
-    }
-
-    .hero-eyebrow {
-        color: #93c5fd;
-        text-transform: uppercase;
-        letter-spacing: 2px;
-        font-size: 12px;
-        font-weight: 700;
-        margin-bottom: 12px;
-    }
-
-    .hero h1 {
-        font-size: clamp(27px, 4vw, 42px);
-        line-height: 1.2;
-        color: #f8fafc;
-        margin: 0 0 14px 0;
-        font-weight: 800;
-    }
-
-    .hero p {
-        color: #cbd5e1;
-        font-size: 15px;
-        line-height: 1.8;
-        max-width: 800px;
-        margin-bottom: 0;
-    }
-
-    .section-heading {
-        font-size: 23px;
-        font-weight: 750;
-        margin-top: 16px;
-        margin-bottom: 5px;
-    }
-
-    .section-subtitle {
-        color: #94a3b8;
-        margin-bottom: 20px;
-        font-size: 14px;
-    }
-
-    .developer-card {
-        padding: 18px;
-        border-radius: 16px;
-        background: rgba(30, 41, 59, 0.65);
-        border: 1px solid rgba(148, 163, 184, 0.22);
-        margin-top: 10px;
-    }
-
-    .developer-label {
-        color: #93c5fd;
-        font-size: 11px;
-        letter-spacing: 1.5px;
-        font-weight: 700;
-        text-transform: uppercase;
-    }
-
-    .developer-name {
-        font-size: 19px;
-        font-weight: 750;
-        margin: 7px 0;
-    }
-
-    .developer-description {
-        font-size: 12px;
-        line-height: 1.7;
-        color: #cbd5e1;
-    }
-
-    div[data-testid="stMetric"] {
-        background: rgba(30, 41, 59, 0.45);
-        padding: 17px;
-        border: 1px solid rgba(148, 163, 184, 0.18);
-        border-radius: 15px;
-    }
-
-    .stButton button,
-    .stDownloadButton button {
-        border-radius: 10px;
-        font-weight: 600;
-        min-height: 42px;
-    }
-
-    div[data-testid="stExpander"] {
-        border-radius: 12px;
-        border: 1px solid rgba(148, 163, 184, 0.2);
-    }
-
-    .footer {
-        text-align: center;
-        padding: 25px 5px 5px 5px;
-        margin-top: 35px;
-        color: #94a3b8;
-        font-size: 12px;
-        border-top: 1px solid rgba(148, 163, 184, 0.15);
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-# ==================================================
-# SIDEBAR
-# ==================================================
+from app.matcher import DEFAULT_WEIGHTS, normalize_weights, rank_resumes
+from app.resume_parser import extract_pdf_text, extract_candidate_info, load_skills
+
+st.set_page_config(page_title="ResumeAI | Shaiq Hassan", page_icon="✦", layout="wide",
+                   initial_sidebar_state="expanded")
+
+SAMPLE_JOB = """Job Title: Python and Machine Learning Developer
+
+Required skills: Python, Machine Learning, Natural Language Processing, Pandas, NumPy, Scikit-learn.
+Responsibilities: Develop and test machine learning models, analyze datasets, build NLP applications,
+evaluate model performance and document results. Preferred qualification: Bachelor's degree in
+Computer Science, Artificial Intelligence, or a related field."""
+
+st.markdown("""
+<style>
+:root{--accent:#7c8cff}
+.block-container{max-width:1500px;padding-top:2.8rem;padding-bottom:3.2rem}
+header[data-testid="stHeader"]{height:3.25rem;background:rgba(10,14,24,.96)}
+div[data-testid="stAppViewBlockContainer"]{padding-top:2.2rem}
+.hero{padding:38px 40px 34px;border-radius:22px;margin:8px 0 26px;background:linear-gradient(115deg,#111827 0%,#1e1b4b 52%,#164e63 100%);border:1px solid #334155;box-shadow:0 14px 40px rgba(0,0,0,.18)}
+.hero .eyebrow{color:#a5b4fc;text-transform:uppercase;letter-spacing:2px;font-size:12px;font-weight:700;margin-bottom:10px}
+.hero h1{color:#f8fafc;font-size:40px;line-height:1.2;margin:0 0 12px;padding:0}
+.hero p{color:#dbeafe;margin:0;max-width:900px;line-height:1.75;font-size:16px}
+.hero .hero-meta{color:#cbd5e1;margin-top:18px;padding-top:14px;border-top:1px solid rgba(203,213,225,.2);font-size:13px}
+.section-kicker{font-size:12px;text-transform:uppercase;letter-spacing:1.5px;color:#94a3b8;font-weight:700}
+div[data-testid="stMetric"]{background:linear-gradient(145deg,rgba(30,41,59,.75),rgba(15,23,42,.75));border:1px solid rgba(148,163,184,.22);padding:17px;border-radius:16px}
+div[data-testid="stMetricLabel"]{color:#cbd5e1}
+div[data-testid="stTabs"] button{font-weight:600}
+.stButton>button{border-radius:10px;transition:all .15s ease}
+.stDownloadButton>button{border-radius:10px}
+div[data-testid="stExpander"]{border-radius:12px;border:1px solid rgba(148,163,184,.22)}
+.small-note{color:#94a3b8;font-size:13px}
+.about-card{padding:18px 20px;border:1px solid rgba(148,163,184,.22);border-radius:14px;background:rgba(30,41,59,.28);margin-bottom:10px}
+.about-card h4{margin:0 0 8px;color:#e2e8f0}
+.about-card p{margin:0;color:#cbd5e1;line-height:1.65}
+</style>
+<div class="hero">
+ <div class="eyebrow">Local NLP · Explainable scoring · Candidate insights</div>
+ <h1>Intelligent Resume Screening</h1>
+ <p>An explainable resume evaluation workspace that compares candidate evidence with job requirements,
+ breaks down scoring criteria, and helps people make more informed shortlisting decisions.</p>
+ <div class="hero-meta">Developed by <strong>Shaiq Hassan</strong> &nbsp;·&nbsp; Local model processing &nbsp;·&nbsp; No external AI API</div>
+</div>
+""", unsafe_allow_html=True)
 
 with st.sidebar:
-    st.markdown("## 📄 ResumeAI")
-    st.caption("Intelligent Resume Screening")
+    st.markdown("## ✦ ResumeAI")
+    st.markdown("**Developed by Shaiq Hassan**")
+    st.caption("Local model · No external AI API")
     st.divider()
-
-    st.markdown("### Project overview")
-    st.write(
-        "Compare PDF resumes with a job description using "
-        "semantic similarity, skill detection, and candidate ranking."
-    )
-
-    st.markdown("### Technology stack")
-
-    for technology in [
-        "Python",
-        "Streamlit",
-        "Sentence Transformers",
-        "Natural Language Processing",
-        "scikit-learn",
-        "Pandas",
-        "PyPDF",
-    ]:
-        st.markdown(f"- {technology}")
-
+    st.markdown("### Score weighting")
+    st.caption("Set importance. Values are automatically normalized to total 100%.")
+    raw_weights = {
+        "semantic_similarity": float(st.slider("Semantic relevance", 0, 100, 35, key="w_sem")),
+        "required_skill_coverage": float(st.slider("Required skills", 0, 100, 30, key="w_skill")),
+        "project_relevance": float(st.slider("Project evidence", 0, 100, 15, key="w_project")),
+        "experience_match": float(st.slider("Experience evidence", 0, 100, 10, key="w_exp")),
+        "education_match": float(st.slider("Education evidence", 0, 100, 10, key="w_edu")),
+    }
+    if sum(raw_weights.values()) == 0:
+        st.error("Increase at least one weight to continue.")
+        effective_weights = None
+    else:
+        effective_weights = normalize_weights(raw_weights)
+        st.markdown("**Effective weights (normalized)**")
+        for key, label in [
+            ("semantic_similarity", "Semantic"),
+            ("required_skill_coverage", "Skills"),
+            ("project_relevance", "Projects"),
+            ("experience_match", "Experience"),
+            ("education_match", "Education"),
+        ]:
+            st.caption(f"{label}: {effective_weights[key]:.1f}%")
+        st.progress(1.0)
     st.divider()
+    st.caption("Scores are evidence indicators, not a hiring decision.")
 
-    st.markdown(
-        """
-        <div class="developer-card">
-            <div class="developer-label">Developed by</div>
-            <div class="developer-name">Shaiq Hassan</div>
-            <div class="developer-description">
-                AI and Machine Learning project<br>
-                Built with Python, NLP and Machine Learning.
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+top1, top2 = st.columns([3, 1])
+with top1:
+    st.markdown('<div class="section-kicker">01 / Role definition</div>', unsafe_allow_html=True)
+    st.subheader("Define the job")
+# Button callbacks update widget state before Streamlit creates the text area.
+def load_sample_role():
+    st.session_state["job_description"] = SAMPLE_JOB
 
-    st.caption("Local application • No external AI API")
+def clear_job_role():
+    st.session_state["job_description"] = ""
 
+with top2:
+    st.write("")
+    st.button("↻ Reset example", use_container_width=True,
+              on_click=load_sample_role)
 
-# ==================================================
-# HERO
-# ==================================================
+job_description = st.text_area("Job description", key="job_description", height=155,
+    placeholder="Paste job title, responsibilities and requirements here.")
+b1, b2, b3 = st.columns([1, 1, 2])
+with b1:
+    st.button("Load sample role", use_container_width=True, on_click=load_sample_role)
+with b2:
+    st.button("Clear role", use_container_width=True, on_click=clear_job_role)
+with b3:
+    st.markdown('<p class="small-note">For best results, specify the actual requirements rather than relying on the description alone.</p>', unsafe_allow_html=True)
 
-st.markdown(
-    """
-    <div class="hero">
-        <div class="hero-eyebrow">AI · NLP · MACHINE LEARNING</div>
-        <h1>Intelligent Resume Screening</h1>
-        <p>
-            Compare resumes, inspect skill coverage, check resume quality,
-            and generate useful candidate reports.
-        </p>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+st.markdown("#### Structured criteria")
+try:
+    skill_catalogue = sorted(set(load_skills()), key=str.lower)
+except Exception as exc:
+    st.error(f"Could not load data/skills.csv: {exc}")
+    skill_catalogue = []
 
+def suggest_skills(description, catalogue):
+    """Find catalogue terms explicitly mentioned in the job description."""
+    found = []
+    normalized = re.sub(r"\s+", " ", (description or "").lower())
+    for skill in catalogue:
+        pattern = r"(?<![a-z0-9])" + re.escape(skill.lower()) + r"(?![a-z0-9])"
+        if re.search(pattern, normalized):
+            found.append(skill)
+    return found
 
-# ==================================================
-# JOB DESCRIPTION
-# ==================================================
+suggested = suggest_skills(job_description, skill_catalogue)
 
-st.markdown(
-    '<div class="section-heading">01 · Define the opportunity</div>',
-    unsafe_allow_html=True,
-)
-st.markdown(
-    '<div class="section-subtitle">'
-    'Enter the job requirements that candidates will be compared against.'
-    '</div>',
-    unsafe_allow_html=True,
-)
+# Keep the required-skill selection synchronized when the job description changes.
+# Do not reset it on every rerun (for example, when the user changes a slider).
+previous_job_text = st.session_state.get("_last_job_text_for_skill_detection")
+if "required_skills" not in st.session_state:
+    st.session_state["required_skills"] = suggested or [
+        s for s in ["Python", "Machine Learning", "Natural Language Processing", "Pandas", "NumPy"]
+        if s in skill_catalogue
+    ]
+elif previous_job_text is not None and job_description != previous_job_text:
+    st.session_state["required_skills"] = suggested
 
-button_col1, button_col2 = st.columns(2)
+st.session_state["_last_job_text_for_skill_detection"] = job_description
 
-with button_col1:
-    if st.button(
-        "✨ Load sample job description",
-        use_container_width=True,
-    ):
-        st.session_state["job_description"] = SAMPLE_JOB_DESCRIPTION
+skill1, skill2 = st.columns(2)
+with skill1:
+    required_skills = st.multiselect("Required skills", skill_catalogue, key="required_skills",
+        help="These selected skills drive the required-skill coverage score.")
+    if suggested:
+        st.caption("Detected in job description: " + ", ".join(suggested))
+        if st.button("Select all detected skills", key="select_detected_skills"):
+            st.session_state["required_skills"] = suggested
+            st.rerun()
+    elif job_description.strip():
+        st.caption("No catalogue skills found automatically. Add skills manually from the list.")
+with skill2:
+    preferred_skills = st.multiselect("Preferred skills (informational)", skill_catalogue,
+        help="Reported separately; not included in the weighted score.")
 
-with button_col2:
-    if st.button(
-        "Clear job description",
-        use_container_width=True,
-    ):
-        st.session_state["job_description"] = ""
+crit1, crit2 = st.columns(2)
+with crit1:
+    minimum_years = st.number_input("Minimum years of experience (0 = not scored)", min_value=0, max_value=50, value=0, step=1)
+with crit2:
+    education_requirement = st.selectbox("Minimum education", ["Not specified", "High school", "Diploma", "Bachelor's", "Master's", "PhD/Doctorate"])
 
-job_description = st.text_area(
-    "Job description",
-    key="job_description",
-    height=220,
-    placeholder="Paste the job title, skills, and responsibilities...",
-)
+st.markdown('<div class="section-kicker">02 / Candidate pool</div>', unsafe_allow_html=True)
+st.subheader("Upload resumes")
+uploaded_files = st.file_uploader("Add PDF resumes", type=["pdf"], accept_multiple_files=True,
+                                  help="Use text-based PDFs. Scanned PDFs may need OCR.")
+st.caption(f"{len(uploaded_files) if uploaded_files else 0} resume(s) selected")
 
-
-# ==================================================
-# PDF UPLOAD
-# ==================================================
-
-st.markdown(
-    '<div class="section-heading">02 · Add candidate resumes</div>',
-    unsafe_allow_html=True,
-)
-st.markdown(
-    '<div class="section-subtitle">'
-    'Upload one or more PDF resumes for analysis.'
-    '</div>',
-    unsafe_allow_html=True,
-)
-
-uploaded_files = st.file_uploader(
-    "Select PDF resumes",
-    type=["pdf"],
-    accept_multiple_files=True,
-    help="Select multiple files to compare candidates together.",
-)
-
-if uploaded_files:
-    st.info(f"📎 {len(uploaded_files)} PDF resume(s) selected.")
-
-
-# ==================================================
-# ANALYSIS AND RESUME QUALITY CHECKS
-# ==================================================
-
-if st.button(
-    "🚀 Analyze and Rank Candidates",
-    type="primary",
-    use_container_width=True,
-):
+analyze = st.button("✦ Analyze candidates", type="primary", use_container_width=True)
+if analyze:
     if not job_description.strip():
-        st.warning("Please enter a job description.")
-
+        st.warning("Enter a job description first.")
     elif not uploaded_files:
-        st.warning("Please upload at least one PDF resume.")
-
+        st.warning("Upload at least one PDF resume.")
+    elif not required_skills:
+        st.warning("Select at least one required skill so the skill score is meaningful.")
+    elif effective_weights is None:
+        st.warning("Set at least one scoring weight above zero.")
     else:
-        parsed_resumes = []
-        candidate_details = {}
-        errors = []
-        unreadable_files = []
-
-        progress = st.progress(0, text="Preparing resume analysis...")
-
-        try:
-            available_skills = load_skills()
-        except Exception as error:
-            st.error(f"Could not load the skills database: {error}")
-            available_skills = []
-
-        for index, uploaded_file in enumerate(uploaded_files):
+        candidates, failures = [], []
+        progress = st.progress(0, text="Reading candidate resumes…")
+        for i, file in enumerate(uploaded_files):
             try:
-                resume_text = extract_pdf_text(
-                    io.BytesIO(uploaded_file.getvalue())
-                )
-
-                candidate_info = extract_candidate_info(resume_text)
-                candidate_name = Path(uploaded_file.name).stem
-
-                original_name = candidate_name
-                suffix = 2
-
-                while candidate_name in candidate_details:
-                    candidate_name = f"{original_name}_{suffix}"
-                    suffix += 1
-
+                text = extract_pdf_text(file)
+                if not text.strip():
+                    raise ValueError("No extractable text; possibly a scanned PDF.")
+                info = extract_candidate_info(text)
+                detected = info.get("skills", [])
                 warnings = []
-
-                if candidate_info["email"] == "Not found":
-                    warnings.append("Email address not detected")
-
-                if candidate_info["phone"] == "Not found":
-                    warnings.append("Phone number not detected")
-
-                if not candidate_info["skills"]:
-                    warnings.append("No known skills detected")
-
-                parsed_resumes.append(
-                    {
-                        "candidate_name": candidate_name,
-                        "text": resume_text,
-                    }
-                )
-
-                candidate_details[candidate_name] = {
-                    **candidate_info,
-                    "filename": uploaded_file.name,
-                    "resume_text": resume_text,
-                    "quality_warnings": warnings,
-                }
-
-            except Exception as error:
-                error_message = f"{uploaded_file.name}: {error}"
-                errors.append(error_message)
-                unreadable_files.append(uploaded_file.name)
-
-            progress.progress(
-                (index + 1) / len(uploaded_files),
-                text=f"Checking resumes: {index + 1} of {len(uploaded_files)}",
-            )
-
+                if not info.get("email"): warnings.append("Email not detected")
+                if not info.get("phone"): warnings.append("Phone not detected")
+                if not detected: warnings.append("No configured skills detected")
+                candidates.append({
+                    "candidate_name": file.name.rsplit(".", 1)[0],
+                    "filename": file.name, "text": text,
+                    "email": info.get("email", ""), "phone": info.get("phone", ""),
+                    "detected_skill_list": detected, "skills": ", ".join(detected),
+                    "quality_warnings": warnings, "quality_warning_count": len(warnings),
+                })
+            except Exception as exc:
+                failures.append({"filename": file.name, "error": str(exc)})
+            progress.progress((i + 1) / len(uploaded_files), text=f"Processed {i+1}/{len(uploaded_files)}")
         progress.empty()
-
-        if errors:
-            st.warning(
-                f"{len(errors)} file(s) could not be processed. "
-                "They are excluded from candidate ranking."
-            )
-
-            for error in errors:
-                st.write(f"- {error}")
-
-        st.session_state["unreadable_files"] = unreadable_files
-
-        if not parsed_resumes:
-            st.session_state["resume_results"] = None
-            st.session_state["quality_summary"] = {}
-            st.error(
-                "No readable resumes were available for matching. "
-                "If these are scanned PDFs, OCR may be required."
-            )
-
-        else:
+        if candidates:
             try:
-                with st.spinner(
-                    "Matching resumes and checking candidate information..."
-                ):
-                    results = rank_resumes(
-                        job_description,
-                        parsed_resumes,
-                    )
+                ranked = rank_resumes(job_description, candidates, required_skills, preferred_skills,
+                    int(minimum_years), education_requirement, effective_weights)
+                st.session_state["resume_results"] = ranked
+                st.session_state["analysis_failures"] = failures
+                st.session_state["analyzed_role"] = job_description
+                st.session_state["analyzed_required_skills"] = required_skills
+                st.success(f"Analysis complete — {len(ranked)} candidate(s) evaluated.")
+            except Exception as exc:
+                st.error(f"Analysis failed: {exc}")
+        else:
+            st.error("No readable resumes could be analyzed.")
+            st.session_state["analysis_failures"] = failures
 
-                job_skills = find_skills(
-                    job_description,
-                    available_skills,
-                )
-
-                for result in results:
-                    details = candidate_details[result["candidate_name"]]
-                    detected_skills = details["skills"]
-
-                    detected_lookup = {
-                        skill.casefold()
-                        for skill in detected_skills
-                    }
-
-                    matched_skills = [
-                        skill for skill in job_skills
-                        if skill.casefold() in detected_lookup
-                    ]
-
-                    not_detected_skills = [
-                        skill for skill in job_skills
-                        if skill.casefold() not in detected_lookup
-                    ]
-
-                    result["email"] = details["email"]
-                    result["phone"] = details["phone"]
-                    result["skills"] = ", ".join(detected_skills)
-                    result["detected_skill_list"] = detected_skills
-                    result["matched_skills"] = matched_skills
-                    result["not_detected_skills"] = not_detected_skills
-                    result["filename"] = details["filename"]
-                    result["resume_text"] = details["resume_text"]
-                    result["quality_warnings"] = details["quality_warnings"]
-                    result["quality_warning_count"] = len(
-                        details["quality_warnings"]
-                    )
-
-                results_df = pd.DataFrame(results)
-
-                st.session_state["resume_results"] = results_df
-                st.session_state["job_skills"] = job_skills
-                st.session_state["quality_summary"] = {
-                    "uploaded": len(uploaded_files),
-                    "processed": len(results_df),
-                    "unreadable": len(unreadable_files),
-                    "with_warnings": int(
-                        results_df["quality_warning_count"].gt(0).sum()
-                    ),
-                }
-
-                st.success(
-                    f"Analysis completed for {len(results_df)} candidate(s)."
-                )
-
-            except Exception as error:
-                st.error(f"Matching failed: {error}")
-
-
-# ==================================================
-# RESULTS DASHBOARD
-# ==================================================
-
-results_df = st.session_state["resume_results"]
-
-if results_df is not None and not results_df.empty:
+results = st.session_state.get("resume_results", [])
+if results:
+    df = pd.DataFrame(results)
     st.divider()
-
-    st.markdown(
-        '<div class="section-heading">03 · Candidate intelligence</div>',
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        '<div class="section-subtitle">'
-        'Explore similarity, skill coverage, resume quality, and reports.'
-        '</div>',
-        unsafe_allow_html=True,
-    )
-
-    metric1, metric2, metric3 = st.columns(3)
-
-    with metric1:
-        st.metric("Candidates analyzed", len(results_df))
-
-    with metric2:
-        st.metric(
-            "Highest similarity",
-            f"{results_df['similarity_percent'].max():.2f}%",
-        )
-
-    with metric3:
-        st.metric(
-            "Average similarity",
-            f"{results_df['similarity_percent'].mean():.2f}%",
-        )
-
-    st.caption(
-        "Similarity measures textual relevance. It is not a probability "
-        "of job success or proof of qualification."
-    )
-
-    # ----------------------------------------------
-    # QUALITY SUMMARY
-    # ----------------------------------------------
-
-    st.divider()
-    st.markdown("### 🩺 Resume quality overview")
-
-    quality = st.session_state.get("quality_summary", {})
-
-    q1, q2, q3, q4 = st.columns(4)
-
-    q1.metric("Files uploaded", quality.get("uploaded", 0))
-    q2.metric("Readable resumes", quality.get("processed", 0))
-    q3.metric("Resumes with warnings", quality.get("with_warnings", 0))
-    q4.metric("Unreadable files", quality.get("unreadable", 0))
-
-    if quality.get("with_warnings", 0) > 0:
-        st.warning(
-            "Some readable resumes are missing contact details or "
-            "have no skills detected. Review the candidate quality checks."
-        )
-    else:
-        st.success(
-            "No missing-contact or empty-skill warnings were detected "
-            "in the readable resumes."
-        )
-
-    unreadable_files = st.session_state.get("unreadable_files", [])
-
-    if unreadable_files:
-        with st.expander("View unreadable or failed files"):
-            for filename in unreadable_files:
-                st.error(
-                    f"{filename}: could not be processed. "
-                    "Check that the PDF opens and contains extractable text."
-                )
-
-    # ----------------------------------------------
-    # SEARCH AND SORT
-    # ----------------------------------------------
-
-    search_col, sort_col = st.columns([2, 1])
-
-    with search_col:
-        search_term = st.text_input(
-            "🔎 Search candidates",
-            placeholder="Search name, email, or skill...",
-        )
-
-    with sort_col:
-        sort_option = st.selectbox(
-            "Sort candidates",
-            [
-                "Highest similarity",
-                "Lowest similarity",
-                "Candidate name",
-            ],
-        )
-
-    filtered_df = results_df.copy()
-
-    if search_term.strip():
-        searchable_columns = [
-            "candidate_name",
-            "email",
-            "skills",
-            "filename",
-        ]
-
-        mask = pd.Series(False, index=filtered_df.index)
-
-        for column in searchable_columns:
-            mask |= filtered_df[column].astype(str).str.contains(
-                search_term,
-                case=False,
-                na=False,
-                regex=False,
-            )
-
-        filtered_df = filtered_df[mask]
-
-    if sort_option == "Lowest similarity":
-        filtered_df = filtered_df.sort_values(
-            "similarity_score",
-            ascending=True,
-        )
-
-    elif sort_option == "Candidate name":
-        filtered_df = filtered_df.sort_values(
-            "candidate_name",
-            ascending=True,
-        )
-
-    else:
-        filtered_df = filtered_df.sort_values(
-            "similarity_score",
-            ascending=False,
-        )
-
-    # ----------------------------------------------
-    # CANDIDATE TABLE
-    # ----------------------------------------------
-
-    st.markdown("### Candidate ranking")
-
-    if filtered_df.empty:
-        st.info("No candidates match your search.")
-
-    else:
-        st.dataframe(
-            filtered_df[
-                [
-                    "rank",
-                    "candidate_name",
-                    "similarity_percent",
-                    "email",
-                    "phone",
-                    "skills",
-                    "quality_warning_count",
-                ]
-            ],
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "rank": st.column_config.NumberColumn("Rank"),
-                "candidate_name": st.column_config.TextColumn("Candidate"),
-                "similarity_percent": st.column_config.NumberColumn(
-                    "Similarity (%)",
-                    format="%.2f%%",
-                ),
-                "email": st.column_config.TextColumn("Email"),
-                "phone": st.column_config.TextColumn("Phone"),
-                "skills": st.column_config.TextColumn(
-                    "Detected skills",
-                    width="large",
-                ),
-                "quality_warning_count": st.column_config.NumberColumn(
-                    "Quality warnings"
-                ),
-            },
-        )
-
-    # ----------------------------------------------
-    # VISUAL MATCH STRENGTH
-    # ----------------------------------------------
-
-    st.divider()
-    st.markdown("### 📊 Visual match strength")
-
-    for _, candidate in filtered_df.iterrows():
-        score = float(candidate["similarity_percent"])
-        label, emoji = get_match_strength(score)
-
-        with st.container(border=True):
-            top_col, score_col = st.columns([3, 1])
-
-            with top_col:
-                st.markdown(
-                    f"**{int(candidate['rank'])}. "
-                    f"{candidate['candidate_name']}**"
-                )
-                st.caption(f"{emoji} {label}")
-
-            with score_col:
-                st.metric("Similarity", f"{score:.2f}%")
-
-            st.progress(
-                max(0.0, min(1.0, score / 100.0)),
-                text=f"{score:.2f}% textual similarity",
-            )
-
-    # ----------------------------------------------
-    # CANDIDATE DEEP DIVE
-    # ----------------------------------------------
-
-    st.divider()
-    st.markdown("### 🔍 Candidate deep dive")
-
-    job_skills = st.session_state.get("job_skills", [])
-
-    if job_skills:
-        st.write("**Skills identified in the job description:**")
-        st.write(" · ".join(job_skills))
-    else:
-        st.info(
-            "No skills from the local skills database were found in "
-            "the job description."
-        )
-
-    for _, candidate in filtered_df.iterrows():
-        with st.expander(
-            f"#{int(candidate['rank'])} · "
-            f"{candidate['candidate_name']} — "
-            f"{candidate['similarity_percent']:.2f}% similarity"
-        ):
-            contact_tab, skills_tab, preview_tab, quality_tab = st.tabs(
-                [
-                    "Contact details",
-                    "Skill comparison",
-                    "Resume text preview",
-                    "Quality checks",
-                ]
-            )
-
-            with contact_tab:
-                st.write(f"**Email:** {candidate['email']}")
-                st.write(f"**Phone:** {candidate['phone']}")
-                st.write(f"**PDF:** {candidate['filename']}")
-
-            with skills_tab:
-                skill_col1, skill_col2 = st.columns(2)
-
-                with skill_col1:
-                    st.markdown("#### ✅ Detected in resume")
-
-                    if candidate["matched_skills"]:
-                        for skill in candidate["matched_skills"]:
-                            st.success(f"✓ {skill}")
-                    else:
-                        st.write("No job-description skills detected.")
-
-                with skill_col2:
-                    st.markdown("#### 🔎 Not detected")
-
-                    if candidate["not_detected_skills"]:
-                        for skill in candidate["not_detected_skills"]:
-                            st.warning(f"! {skill}")
-                    else:
-                        st.success("All listed job skills were detected.")
-
-                st.caption(
-                    "Keyword matching can miss synonyms or differently "
-                    "phrased skills. Verify the original resume."
-                )
-
-                st.metric(
-                    "Job-description skills detected",
-                    f"{len(candidate['matched_skills'])} / "
-                    f"{len(job_skills)}",
-                )
-
-            with preview_tab:
-                st.caption(
-                    "Extracted text preview; original PDF layout is not shown."
-                )
-
-                st.text_area(
-                    "Extracted resume content",
-                    value=str(candidate["resume_text"]),
-                    height=300,
-                    disabled=True,
-                    key=(
-                        f"preview_{candidate['rank']}_"
-                        f"{candidate['candidate_name']}"
-                    ),
-                )
-
-            with quality_tab:
-                warnings = candidate["quality_warnings"]
-
-                if warnings:
-                    st.warning(
-                        f"{len(warnings)} quality warning(s) for this resume."
-                    )
-
-                    for warning in warnings:
-                        st.write(f"- {warning}")
-                else:
-                    st.success("No configured quality warnings detected.")
-
-                st.caption(
-                    "These checks cover text extraction, contact details, "
-                    "and known skills. They do not assess the candidate's "
-                    "actual qualifications or the truth of resume claims."
-                )
-
-    # ----------------------------------------------
-    # FEATURE 4: REPORTS AND FILTERED EXPORT
-    # ----------------------------------------------
-
-    st.divider()
-    st.markdown("### 📑 Export reports")
-
-    st.write(
-        "The comprehensive report contains score statistics, candidate "
-        "details, quality warnings, and detected-skill frequency."
-    )
-
-    report_data = build_report_csv(
-        results_df,
-        job_description,
-        job_skills,
-    )
-
-    export_col1, export_col2 = st.columns(2)
-
-    with export_col1:
-        st.download_button(
-            "⬇️ Download comprehensive report",
-            data=report_data,
-            file_name="resume_screening_full_report.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-
-    with export_col2:
-        filtered_export_data = build_candidate_csv(filtered_df)
-
-        st.download_button(
-            f"⬇️ Export filtered candidates ({len(filtered_df)})",
-            data=filtered_export_data,
-            file_name="resume_screening_filtered_candidates.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-
-    st.caption(
-        "The comprehensive report includes all successfully analyzed "
-        "candidates. The filtered export includes only the candidates "
-        "currently shown by your search and sort controls."
-    )
-
-
-# ==================================================
-# ABOUT SECTION
-# ==================================================
+    st.markdown('<div class="section-kicker">03 / Insights</div>', unsafe_allow_html=True)
+    st.subheader("Candidate summary")
+    scored = [r["overall_match_score"] for r in results if r.get("overall_match_score") is not None]
+    semantics = [r["semantic_similarity"] for r in results if r.get("semantic_similarity") is not None]
+    metrics = st.columns(4)
+    metrics[0].metric("Candidates analyzed", len(results))
+    metrics[1].metric("Top weighted score", f"{max(scored):.1f}/100" if scored else "N/A")
+    metrics[2].metric("Average weighted score", f"{sum(scored)/len(scored):.1f}/100" if scored else "N/A")
+    metrics[3].metric("Avg. semantic similarity", f"{sum(semantics)/len(semantics):.1f}%" if semantics else "N/A")
+
+    t_rank, t_compare, t_graph, t_summary, t_export = st.tabs(
+        ["Rankings", "Compare", "Analytics", "Summary report", "Export"])
+
+    score_columns = ["rank", "candidate_name", "overall_match_score", "semantic_similarity",
+                     "required_skill_coverage", "project_relevance", "experience_match",
+                     "education_match", "available_weight_percent"]
+    with t_rank:
+        filter_text = st.text_input("Search candidates", placeholder="Name, filename, skills…")
+        sort_by = st.selectbox("Sort by", ["overall_match_score", "required_skill_coverage",
+            "semantic_similarity", "project_relevance", "experience_match", "education_match"])
+        shown = df.copy()
+        if filter_text:
+            shown = shown[shown.astype(str).apply(
+                lambda col: col.str.contains(filter_text, case=False, na=False)).any(axis=1)]
+        shown = shown.sort_values(sort_by, ascending=False, na_position="last")
+        st.dataframe(shown[[c for c in score_columns if c in shown.columns]],
+                     use_container_width=True, hide_index=True)
+        st.caption("‘Not detected’ means the text parser did not find evidence; it does not prove a candidate lacks that skill.")
+        for row in shown.to_dict("records"):
+            with st.expander(f"#{row['rank']} · {row['candidate_name']} · {row['overall_match_score'] if row['overall_match_score'] is not None else 'N/A'}/100"):
+                st.write(f"**Email:** {row.get('email') or 'Not detected'}")
+                st.write(f"**Phone:** {row.get('phone') or 'Not detected'}")
+                st.write("**Required skills detected:** " + (", ".join(row.get("matched_required_skills", [])) or "None detected"))
+                st.write("**Required skills not detected:** " + (", ".join(row.get("missing_required_skills", [])) or "None"))
+                st.write("**Preferred skills detected:** " + (", ".join(row.get("matched_preferred_skills", [])) or "None detected"))
+                for note in row.get("explanations", []):
+                    st.markdown("- " + note)
+                if row.get("quality_warnings"):
+                    st.warning("Resume quality flags: " + "; ".join(row["quality_warnings"]))
+                with st.expander("Resume text preview"):
+                    st.text_area("Extracted text", row.get("text", ""), height=200,
+                                 key="preview_" + row["filename"])
+
+    with t_compare:
+        options = {f"#{r['rank']} · {r['candidate_name']}": r["filename"] for r in results}
+        selected = st.multiselect("Select up to four candidates", list(options.keys()),
+                                  default=list(options.keys())[:2], max_selections=4)
+        selected_files = [options[x] for x in selected]
+        subset = [r for r in results if r["filename"] in selected_files]
+        if subset:
+            comp = pd.DataFrame([{
+                "Candidate": r["candidate_name"], "Rank": r["rank"],
+                "Weighted score": r["overall_match_score"], "Semantic": r["semantic_similarity"],
+                "Skills": r["required_skill_coverage"], "Projects": r["project_relevance"],
+                "Experience": r["experience_match"], "Education": r["education_match"],
+                "Matched skills": ", ".join(r["matched_required_skills"]),
+                "Not detected": ", ".join(r["missing_required_skills"]),
+            } for r in subset])
+            st.dataframe(comp, use_container_width=True, hide_index=True)
+            graph = comp.set_index("Candidate")[["Weighted score", "Semantic", "Skills", "Projects", "Experience", "Education"]]
+            st.bar_chart(graph)
+
+    with t_graph:
+        st.markdown("#### Score components by candidate")
+        chart = df[["candidate_name", "overall_match_score", "semantic_similarity",
+                    "required_skill_coverage", "project_relevance", "experience_match",
+                    "education_match"]].set_index("candidate_name")
+        st.bar_chart(chart)
+        g1, g2 = st.columns(2)
+        with g1:
+            st.markdown("#### Required skill coverage")
+            coverage = Counter(skill for row in results for skill in row.get("matched_required_skills", []))
+            if coverage:
+                st.bar_chart(pd.DataFrame([{"Skill": k, "Candidates": v} for k, v in coverage.items()]).set_index("Skill"))
+            else:
+                st.info("No required skills detected yet.")
+        with g2:
+            st.markdown("#### Resume quality flags")
+            st.bar_chart(pd.DataFrame([{"Candidate": r["candidate_name"],
+                "Flags": r.get("quality_warning_count", 0)} for r in results]).set_index("Candidate"))
+
+    with t_summary:
+        best = results[0]
+        avg_score = sum(scored) / len(scored) if scored else 0
+        st.markdown("#### Screening summary")
+        st.write(f"**Role analyzed:** {st.session_state.get('analyzed_role', '')[:500]}")
+        st.write(f"**Candidates processed:** {len(results)}")
+        st.write(f"**Highest weighted score:** {best['candidate_name']} ({best['overall_match_score']}/100)")
+        st.write(f"**Average weighted score:** {avg_score:.1f}/100")
+        st.write(f"**Required criteria:** {', '.join(st.session_state.get('analyzed_required_skills', []))}")
+        st.markdown("#### Top candidates")
+        st.dataframe(pd.DataFrame([{"Rank": r["rank"], "Candidate": r["candidate_name"],
+            "Weighted score": r["overall_match_score"], "Skill coverage": r["required_skill_coverage"],
+            "Semantic similarity": r["semantic_similarity"]} for r in results[:5]]),
+            use_container_width=True, hide_index=True)
+        st.info("This is a decision-support summary. Review the source resumes before making any hiring decision.")
+
+    with t_export:
+        export = df.drop(columns=["text", "component_scores", "explanations"], errors="ignore").copy()
+        for col in export.columns:
+            if export[col].map(lambda x: isinstance(x, list)).any():
+                export[col] = export[col].apply(lambda x: ", ".join(map(str, x)) if isinstance(x, list) else x)
+            elif export[col].map(lambda x: isinstance(x, dict)).any():
+                export[col] = export[col].apply(lambda x: str(x) if isinstance(x, dict) else x)
+        st.download_button("Download full screening report (CSV)", export.to_csv(index=False).encode("utf-8-sig"),
+            "resume_screening_summary.csv", "text/csv", use_container_width=True)
+        breakdown = df[["rank", "candidate_name", "overall_match_score", "semantic_similarity",
+            "required_skill_coverage", "project_relevance", "experience_match", "education_match",
+            "available_weight_percent"]]
+        st.download_button("Download score breakdown (CSV)", breakdown.to_csv(index=False).encode("utf-8-sig"),
+            "resume_score_breakdown.csv", "text/csv", use_container_width=True)
+
+failures = st.session_state.get("analysis_failures", [])
+if failures:
+    with st.expander("Files that could not be analyzed"):
+        st.dataframe(pd.DataFrame(failures), use_container_width=True, hide_index=True)
 
 st.divider()
+st.markdown('<div class="section-kicker">04 / Product guide</div>', unsafe_allow_html=True)
+st.subheader("About this application")
+about_tabs = st.tabs(["Overview", "Key features", "How to use", "Scoring guide", "Developer & limitations"])
 
-about_tab, workflow_tab, notes_tab = st.tabs(
-    [
-        "👨‍💻 About the developer",
-        "⚙️ How it works",
-        "ℹ️ Important notes",
-    ]
-)
-
-with about_tab:
-    st.markdown("### Developed by Shaiq Hassan")
-    st.write(
-        "An educational project exploring Natural Language Processing "
-        "and Machine Learning for resume analysis and job-description matching."
-    )
-    st.write(
-        "Python · Streamlit · Sentence Transformers · "
-        "scikit-learn · Pandas · PyPDF"
-    )
-
-with workflow_tab:
-    st.markdown("### How the application works")
-    st.markdown(
-        """
-        1. Enter a job description and upload PDF resumes.
-        2. Extract text, contact information, and known skills.
-        3. Generate semantic embeddings with Sentence Transformers.
-        4. Calculate cosine similarity and rank candidates.
-        5. Inspect skills, resume quality, and extracted text.
-        6. Export the comprehensive report or filtered candidates.
-        """
-    )
-
-with notes_tab:
-    st.markdown("### Responsible use")
-    st.write(
-        "Similarity scores do not predict job success or prove qualifications."
-    )
-    st.write(
-        "A skill not detected by the keyword matcher may still be present "
-        "under different wording."
-    )
-    st.write(
-        "Scanned image-only PDFs may require OCR, which is not implemented."
-    )
-    st.write(
-        "Review resumes directly and use consistent, job-related criteria."
-    )
-    st.write(
-        "The embedding model runs locally when its required files are "
-        "available. The optional Google Font may require internet access."
-    )
-
-
-# ==================================================
-# FOOTER
-# ==================================================
-
-st.markdown(
-    """
-    <div class="footer">
-        <strong>Intelligent Resume Screening</strong><br>
-        Developed by Shaiq Hassan · Python · NLP · Machine Learning<br>
-        Educational project and decision-support demonstration.
+with about_tabs[0]:
+    st.markdown("""
+    <div class="about-card">
+      <h4>Purpose</h4>
+      <p><strong>Intelligent Resume Screening</strong> is a locally run, NLP-based decision-support application.
+      It compares resume text with a job description and explicit role criteria, then presents a transparent
+      score breakdown so a reviewer can inspect the evidence behind each ranking.</p>
     </div>
-    """,
-    unsafe_allow_html=True,
-)
+    """, unsafe_allow_html=True)
+    a, b, c = st.columns(3)
+    a.metric("Processing", "Local")
+    b.metric("External AI APIs", "None")
+    c.metric("Primary output", "Explainable ranking")
+
+with about_tabs[1]:
+    feature_cols = st.columns(2)
+    with feature_cols[0]:
+        st.markdown("""
+        <div class="about-card"><h4>Candidate evaluation</h4>
+        <p>Semantic relevance, required-skill coverage, project relevance, and optional experience and education evidence.</p></div>
+        <div class="about-card"><h4>Transparent matching</h4>
+        <p>Matched and not-detected required skills, component scores, and explanations for unavailable evidence.</p></div>
+        <div class="about-card"><h4>Candidate comparison</h4>
+        <p>Compare multiple candidates side by side with score charts and evidence summaries.</p></div>
+        """, unsafe_allow_html=True)
+    with feature_cols[1]:
+        st.markdown("""
+        <div class="about-card"><h4>Analytics and reports</h4>
+        <p>Score distribution, skill coverage, resume-quality flags, top-candidate summary, and CSV exports.</p></div>
+        <div class="about-card"><h4>Configurable scoring</h4>
+        <p>Adjust the importance of each scoring component; active weights are normalized automatically.</p></div>
+        <div class="about-card"><h4>Privacy-conscious workflow</h4>
+        <p>Model inference runs from a locally available Sentence Transformer model; no external AI API is called by the app.</p></div>
+        """, unsafe_allow_html=True)
+
+with about_tabs[2]:
+    st.markdown("""
+    1. **Define the role:** paste a job description or load the sample role.
+    2. **Select required skills:** review the detected suggestions and select the skills that truly are required.
+    3. **Set optional criteria:** enter a minimum experience level or education requirement only when relevant.
+    4. **Set score weights:** use the sidebar to choose importance. The displayed effective weights are normalized to 100%.
+    5. **Upload resumes:** add text-based PDF resumes and select **Analyze candidates**.
+    6. **Review results:** inspect rankings, matched/not-detected skills, candidate comparison, analytics, and the summary report.
+    7. **Export:** download the full CSV report or the score breakdown for further review.
+    """)
+
+with about_tabs[3]:
+    st.markdown("""
+    The overall score is a weighted combination of the available components:
+    - **Semantic relevance:** similarity between the job description and resume text.
+    - **Required skills:** share of selected required skills detected in the resume text.
+    - **Project evidence:** semantic relevance of text identified as project-related.
+    - **Experience evidence:** compares explicitly stated years with the minimum specified, when detectable.
+    - **Education evidence:** compares a detected broad degree level with the selected minimum, when detectable.
+
+    If a component cannot be assessed, it is excluded from that candidate's calculation and the remaining active weights are normalized. Therefore, check the **available weight** indicator as well as the final score.
+    """)
+
+with about_tabs[4]:
+    st.markdown("""
+    **Developed by Shaiq Hassan**
+
+    Intelligent Resume Screening was built as an academic AI/NLP project using Python, Streamlit,
+    Sentence Transformers, and scikit-learn.
+
+    **Responsible-use notes**
+    - A skill marked “not detected” may still be possessed by the candidate; the term may be absent or phrased differently.
+    - Experience and education extraction are heuristic and should be verified against the original resume.
+    - Scanned PDFs may need OCR before their text can be analyzed.
+    - Scores are evidence indicators, not probabilities of job performance or automatic hiring decisions.
+    - Human review is essential; avoid using protected or irrelevant personal characteristics in screening criteria.
+    """)
+
+st.divider()
+st.markdown("**Intelligent Resume Screening · Developed by Shaiq Hassan**")
+st.caption("Local NLP model · No external AI API · Scores summarize text evidence and should support, not replace, human review.")
