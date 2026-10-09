@@ -28,12 +28,15 @@ def normalize_weights(weights=None):
         raise ValueError("At least one scoring weight must be greater than zero.")
     return {key: value * 100.0 / total for key, value in cleaned.items()}
 
+
 @lru_cache(maxsize=1)
 def load_embedding_model():
-    """Load from a local model folder or local Hugging Face cache only."""
+    """Load a local model if available; otherwise download it from Hugging Face."""
     if LOCAL_MODEL_PATH.is_dir():
-        return SentenceTransformer(str(LOCAL_MODEL_PATH), local_files_only=True)
-    return SentenceTransformer(MODEL_NAME, local_files_only=True)
+        return SentenceTransformer(str(LOCAL_MODEL_PATH))
+
+    return SentenceTransformer(MODEL_NAME)
+
 
 def _clean(value):
     return re.sub(r"\s+", " ", str(value or "")).strip()
