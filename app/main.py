@@ -3,6 +3,13 @@ from collections import Counter
 
 import pandas as pd
 import streamlit as st
+import sys
+from pathlib import Path
+# Ensure the project root is available for imports on Streamlit Cloud.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.matcher import DEFAULT_WEIGHTS, normalize_weights, rank_resumes
 from app.resume_parser import extract_pdf_text, extract_candidate_info, load_skills
