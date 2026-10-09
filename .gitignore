@@ -1,0 +1,73 @@
+
+# ==========================================
+# Python environments
+# ==========================================
+.venv/
+venv/
+env/
+
+# ==========================================
+# Python cache and build files
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+build/
+dist/
+*.egg-info/
+
+# ==========================================
+# Secrets and local configuration
+# ==========================================
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# ==========================================
+# Private resumes and uploaded documents
+# ==========================================
+*.pdf
+*.doc
+*.docx
+uploads/
+data/resumes/
+private_resumes/
+
+# ==========================================
+# Model downloads and large local files
+# ==========================================
+models/
+checkpoints/
+*.pt
+*.pth
+*.safetensors
+*.onnx
+
+# ==========================================
+# Logs and temporary files
+# ==========================================
+*.log
+*.tmp
+*.bak
+
+# ==========================================
+# Editors and operating systems
+# ==========================================
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ==========================================
+# Test and coverage artifacts
+# ==========================================
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ==========================================
+# Streamlit local settings
+# ==========================================
+.streamlit/config.toml
